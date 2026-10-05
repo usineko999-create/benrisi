@@ -10,15 +10,15 @@ st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layo
 # --- Googleスプレッドシート連携の設定 ---
 CREDENTIALS_FILE = "secret_key.json"
 
-# 【修正】各科目のスプレッドシートファイルごとのキー（ID）を設定します
+# 各科目のスプレッドシートファイルごとのキー（ID）
 # ※実際のURLのID部分にすべて書き換えてください
 SPREADSHEET_KEYS = {
-    "特許・実用新案": "1rrzp90pSYL4YxSJEEtkFB4HZsIi9n3SUsoUX1qEN5XQ", 
-    "意匠": "1hOTVzkr82pqjh_KaoHxV7Zd-dczFtlVdu_DMT-FvNVM",
-    "商標": "1I0HMXWY6CU9mQJWEBdJXn47Xv2_ErdLdTSZ1xxm3AG4",
-    "協定・条約": "1fH1naJGQfKXseXpHrVFnC9ip93YURgCMD67xPhbUEjQ",
-    "不正競争・著作権": "1w9AITUq-3HF53slPwFr83jOhws3kmVVy6dOfqHFHN9c",
-    "全問題": "1NHaNYmOv9TOXdmaDmWbVmIa3RFsXkXhVUYkFgASHtTk"
+    "特許・実用新案": "ここに特許・実用新案のキーを入力", 
+    "意匠": "ここに意匠のキーを入力",
+    "商標": "ここに商標のキーを入力",
+    "協定・条約": "ここに協定・条約のキーを入力",
+    "不正競争・著作権": "ここに不正競争・著作権のキーを入力",
+    "全問題": "ここに全問題のキーを入力"
 }
 
 @st.cache_resource
@@ -36,6 +36,8 @@ if 'stage' not in st.session_state:
     st.session_state.stage = 'select_subject' 
 if 'df' not in st.session_state:
     st.session_state.df = None
+if 'worksheet' not in st.session_state:
+    st.session_state.worksheet = None
 if 'selected_subject_name' not in st.session_state:
     st.session_state.selected_subject_name = None
 if 'questions' not in st.session_state:
@@ -60,25 +62,25 @@ def save_learning_records():
     current_subj = st.session_state.selected_subject_name
     current_key = SPREADSHEET_KEYS[current_subj]
     
-    # 1. 現在学習中のファイルを更新（各ファイルの1つ目のシートを使用）
+    # 1. 現在学習中のファイルを更新（間違えた回数の更新 ＆ 解答済みの出題順序を0にクリア）
     current_ws = client.open_by_key(current_key).sheet1
     for q_text, data in st.session_state.pending_updates.items():
-        current_ws.update_cell(data['row_num'], 5, data['count'])
-        
-    # 2. 他のファイルへ同期（問題文をB列から検索して合致する行を更新）
+        current_ws.update_cell(data['row_num'], 5, data['wrong_count']) # E列:間違えた回数
+        if data.get('clear_order'):
+            current_ws.update_cell(data['row_num'], 6, 0) # F列:出題順序を削除(0にする)
+            
+    # 2. 他のファイルへ「間違えた回数」のみ同期（※出題順序は現在のファイルのみのセッション情報なので同期しない）
     if current_subj != "全問題":
-        # 科目別ファイルを使用中の場合 -> 「全問題」ファイルへ同期
         try:
             sync_ws = client.open_by_key(SPREADSHEET_KEYS["全問題"]).sheet1
-            q_col = sync_ws.col_values(2) # B列（問題文）を取得
+            q_col = sync_ws.col_values(2)
             for q_text, data in st.session_state.pending_updates.items():
                 if q_text in q_col:
                     sync_row = q_col.index(q_text) + 1 
-                    sync_ws.update_cell(sync_row, 5, data['count'])
-        except Exception as e:
-            pass # 該当ファイルや問題が無い場合はスキップ
+                    sync_ws.update_cell(sync_row, 5, data['wrong_count'])
+        except Exception:
+            pass 
     else:
-        # 「全問題」ファイルを使用中の場合 -> 各科目別ファイルへ同期
         remaining = list(st.session_state.pending_updates.keys())
         for subj_name, subj_key in SPREADSHEET_KEYS.items():
             if subj_name == "全問題" or not remaining:
@@ -90,7 +92,7 @@ def save_learning_records():
                 for q_text in remaining:
                     if q_text in q_col:
                         sync_row = q_col.index(q_text) + 1
-                        sync_ws.update_cell(sync_row, 5, st.session_state.pending_updates[q_text]['count'])
+                        sync_ws.update_cell(sync_row, 5, st.session_state.pending_updates[q_text]['wrong_count'])
                         found.append(q_text)
                 for f in found:
                     remaining.remove(f)
@@ -120,7 +122,6 @@ if st.session_state.stage == 'select_subject':
                 client = get_gspread_client()
                 target_key = SPREADSHEET_KEYS[selected_subject]
                 
-                # 選択された科目のファイルを開き、1つ目のシートのデータを取得
                 worksheet = client.open_by_key(target_key).sheet1
                 data = worksheet.get_all_records()
                 df = pd.DataFrame(data)
@@ -130,21 +131,28 @@ if st.session_state.stage == 'select_subject':
                 if '解答' in df.columns and '答え' not in df.columns:
                     df = df.rename(columns={'解答': '答え'})
                     
+                # 間違えた回数(E列)
                 if '間違えた回数' not in df.columns:
                     df['間違えた回数'] = 0
                 else:
                     df['間違えた回数'] = pd.to_numeric(df['間違えた回数'], errors='coerce').fillna(0).astype(int)
+                
+                # 出題順序(F列)
+                if '出題順序' not in df.columns:
+                    df['出題順序'] = 0
+                else:
+                    df['出題順序'] = pd.to_numeric(df['出題順序'], errors='coerce').fillna(0).astype(int)
                     
                 df['row_num'] = df.index + 2 
                 
-                # セッションに保存
+                st.session_state.worksheet = worksheet
                 st.session_state.df = df
                 st.session_state.selected_subject_name = selected_subject
                 st.session_state.stage = 'setup'
                 st.rerun()
                 
         except Exception as e:
-            st.error(f"データの読み込みに失敗しました。設定したキーが正しいか、ロボットがファイルに招待されているか確認してください。\nエラー内容: {e}")
+            st.error(f"データの読み込みに失敗しました。\nエラー内容: {e}")
 
 # ==========================================
 # 設定画面 (stage: setup)
@@ -153,10 +161,28 @@ elif st.session_state.stage == 'setup':
     st.subheader(f"2. 出題設定（{st.session_state.selected_subject_name}）")
     
     df = st.session_state.df
+    worksheet = st.session_state.worksheet
     
+    # --- 前回の続きがあるかチェック ---
+    resume_df = df[df['出題順序'] > 0].copy()
+    if len(resume_df) > 0:
+        st.success(f"💡 前回中断したセッションの続き（残り {len(resume_df)}問）があります。")
+        if st.button("▶️ 前回の続きから再開する", type="primary", use_container_width=True):
+            # 記録された出題順序の通りに並べ替える
+            resume_df = resume_df.sort_values(by='出題順序')
+            st.session_state.questions = resume_df.to_dict('records')
+            st.session_state.current_idx = 0
+            st.session_state.answered = False
+            st.session_state.pending_updates = {}
+            st.session_state.stage = 'quiz'
+            st.rerun()
+        st.markdown("---")
+        st.caption("※下の「新規クイズスタート」を押すと、前回の続きは破棄され、新しい出題順序が設定されます。")
+
+    # --- 新規出題の設定 ---
     categories = list(df['分野'].dropna().unique())
     selected_categories = st.multiselect(
-        "出題範囲（単元）を選択してください", 
+        "新規に出題する範囲（単元）を選択してください", 
         options=categories,
         default=None,
         placeholder="クリックして文字検索・複数選択（未選択の場合は全範囲）"
@@ -167,7 +193,7 @@ elif st.session_state.stage == 'setup':
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("クイズスタート！", type="primary"):
+        if st.button("新規クイズスタート！", type="primary"):
             target_df = df.copy()
             
             if len(selected_categories) > 0:
@@ -185,6 +211,21 @@ elif st.session_state.stage == 'setup':
             if len(target_df) == 0:
                 st.warning("条件に一致する問題がありません。")
             else:
+                with st.spinner("出題順序をスプレッドシートに記録しています..."):
+                    # 選ばれた問題群に 1, 2, 3... と順番番号を付与
+                    target_df['出題順序'] = range(1, len(target_df) + 1)
+                    
+                    # メインのデータフレームを更新（一度全て0にリセットし、今回選ばれたものだけ番号を入れる）
+                    df['出題順序'] = 0
+                    df.loc[target_df.index, '出題順序'] = target_df['出題順序']
+                    
+                    # F列（出題順序）全体をスプレッドシートに一括上書き保存
+                    seq_list = df['出題順序'].tolist()
+                    cell_list = worksheet.range(f'F2:F{len(seq_list)+1}')
+                    for i, cell in enumerate(cell_list):
+                        cell.value = seq_list[i]
+                    worksheet.update_cells(cell_list)
+                
                 st.session_state.questions = target_df.to_dict('records')
                 st.session_state.current_idx = 0
                 st.session_state.answered = False
@@ -214,18 +255,24 @@ elif st.session_state.stage == 'quiz':
     
     def check_answer(user_ans):
         correct_ans = str(current_q['答え']).strip()
+        is_correct = (user_ans == correct_ans)
+        st.session_state.is_correct = is_correct
         
-        if user_ans == correct_ans:
-            st.session_state.is_correct = True
-        else:
-            st.session_state.is_correct = False
+        row = int(current_q['row_num'])
+        q_text = str(current_q['問題']).strip()
+        current_wrong_count = int(current_q['間違えた回数'])
+        
+        # 誤りの場合のみカウントを増やす
+        if not is_correct:
+            current_wrong_count += 1
+            st.session_state.questions[st.session_state.current_idx]['間違えた回数'] = current_wrong_count
             
-            new_count = int(current_q['間違えた回数']) + 1
-            row = int(current_q['row_num'])
-            q_text = str(current_q['問題']).strip()
-            st.session_state.pending_updates[q_text] = {'row_num': row, 'count': new_count}
-            
-            st.session_state.questions[st.session_state.current_idx]['間違えた回数'] = new_count
+        # 解答済みとして、出題順序を削除する(0にする)フラグを立てて記録
+        st.session_state.pending_updates[q_text] = {
+            'row_num': row, 
+            'wrong_count': current_wrong_count,
+            'clear_order': True
+        }
             
         st.session_state.answered = True
 
@@ -260,9 +307,9 @@ elif st.session_state.stage == 'quiz':
                 st.rerun()
 
     st.markdown("---")
-    if st.button("⏸️ 中断してここまでの記録を保存", use_container_width=True):
+    if st.button("⏸️ 中断して経過を保存", use_container_width=True):
         if st.session_state.pending_updates:
-            with st.spinner("ファイル間で学習記録を同期保存しています..."):
+            with st.spinner("ファイル間で学習記録を同期し、解答済みの出題順序を削除しています..."):
                 save_learning_records()
         st.session_state.stage = 'select_subject'
         st.rerun()
@@ -275,9 +322,9 @@ elif st.session_state.stage == 'result':
     st.subheader("お疲れ様でした！全問終了です。")
     
     if st.session_state.pending_updates:
-        with st.spinner("ファイル間で学習記録を同期保存しています..."):
+        with st.spinner("ファイル間で学習記録を同期し、出題順序をクリアしています..."):
             save_learning_records()
-        st.success("すべてのファイルに学習記録が保存・同期されました！")
+        st.success("すべての学習記録が保存・同期されました！")
         
     if st.button("科目選択に戻る"):
         st.session_state.stage = 'select_subject'
