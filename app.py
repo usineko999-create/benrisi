@@ -11,14 +11,13 @@ st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layo
 CREDENTIALS_FILE = "secret_key.json"
 
 # 各科目のスプレッドシートファイルごとのキー（ID）
-# ※実際のURLのID部分にすべて書き換えてください
 SPREADSHEET_KEYS = {
-    "特許・実用新案": "ここに特許・実用新案のキーを入力", 
-    "意匠": "ここに意匠のキーを入力",
-    "商標": "ここに商標のキーを入力",
-    "協定・条約": "ここに協定・条約のキーを入力",
-    "不正競争・著作権": "ここに不正競争・著作権のキーを入力",
-    "全問題": "ここに全問題のキーを入力"
+    "特許・実用新案": "1rrzp90pSYL4YxSJEEtkFB4HZsIi9n3SUsoUX1qEN5XQ", 
+    "意匠": "1hOTVzkr82pqjh_KaoHxV7Zd-dczFtlVdu_DMT-FvNVM",
+    "商標": "1I0HMXWY6CU9mQJWEBdJXn47Xv2_ErdLdTSZ1xxm3AG4",
+    "協定・条約": "1fH1naJGQfKXseXpHrVFnC9ip93YURgCMD67xPhbUEjQ",
+    "不正競争・著作権": "1w9AITUq-3HF53slPwFr83jOhws3kmVVy6dOfqHFHN9c",
+    "全問題": "1NHaNYmOv9TOXdmaDmWbVmIa3RFsXkXhVUYkFgASHtTk"
 }
 
 @st.cache_resource
@@ -69,7 +68,7 @@ def save_learning_records():
         if data.get('clear_order'):
             current_ws.update_cell(data['row_num'], 6, 0) # F列:出題順序を削除(0にする)
             
-    # 2. 他のファイルへ「間違えた回数」のみ同期（※出題順序は現在のファイルのみのセッション情報なので同期しない）
+    # 2. 他のファイルへ「間違えた回数」のみ同期
     if current_subj != "全問題":
         try:
             sync_ws = client.open_by_key(SPREADSHEET_KEYS["全問題"]).sheet1
@@ -168,7 +167,6 @@ elif st.session_state.stage == 'setup':
     if len(resume_df) > 0:
         st.success(f"💡 前回中断したセッションの続き（残り {len(resume_df)}問）があります。")
         if st.button("▶️ 前回の続きから再開する", type="primary", use_container_width=True):
-            # 記録された出題順序の通りに並べ替える
             resume_df = resume_df.sort_values(by='出題順序')
             st.session_state.questions = resume_df.to_dict('records')
             st.session_state.current_idx = 0
@@ -212,14 +210,11 @@ elif st.session_state.stage == 'setup':
                 st.warning("条件に一致する問題がありません。")
             else:
                 with st.spinner("出題順序をスプレッドシートに記録しています..."):
-                    # 選ばれた問題群に 1, 2, 3... と順番番号を付与
                     target_df['出題順序'] = range(1, len(target_df) + 1)
                     
-                    # メインのデータフレームを更新（一度全て0にリセットし、今回選ばれたものだけ番号を入れる）
                     df['出題順序'] = 0
                     df.loc[target_df.index, '出題順序'] = target_df['出題順序']
                     
-                    # F列（出題順序）全体をスプレッドシートに一括上書き保存
                     seq_list = df['出題順序'].tolist()
                     cell_list = worksheet.range(f'F2:F{len(seq_list)+1}')
                     for i, cell in enumerate(cell_list):
@@ -262,12 +257,10 @@ elif st.session_state.stage == 'quiz':
         q_text = str(current_q['問題']).strip()
         current_wrong_count = int(current_q['間違えた回数'])
         
-        # 誤りの場合のみカウントを増やす
         if not is_correct:
             current_wrong_count += 1
             st.session_state.questions[st.session_state.current_idx]['間違えた回数'] = current_wrong_count
             
-        # 解答済みとして、出題順序を削除する(0にする)フラグを立てて記録
         st.session_state.pending_updates[q_text] = {
             'row_num': row, 
             'wrong_count': current_wrong_count,
