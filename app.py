@@ -50,7 +50,7 @@ if 'pending_updates' not in st.session_state:
     st.session_state.pending_updates = {}
 
 # ==========================================
-# 複数ファイル間の同期保存処理
+# 複数ファイル間の一括同期保存処理（API制限回避版）
 # ==========================================
 def save_learning_records():
     if not st.session_state.pending_updates:
@@ -58,53 +58,54 @@ def save_learning_records():
         
     client = get_gspread_client()
     current_subj = st.session_state.selected_subject_name
-    current_key = SPREADSHEET_KEYS[current_subj]
     
-    # 1. 現在学習中のファイルを更新（間違えた回数の更新 ＆ 解答済みの出題順序を0にクリア）
-    current_ws = client.open_by_key(current_key).sheet1
+    # バッチ処理用ヘルパー関数：E列(間違えた回数)とF列(出題順序)を一括更新する
+    def batch_update_ef(ws, updates_dict):
+        if not updates_dict: return
+        max_row = max(updates_dict.keys())
+        cells = ws.range(f'E2:F{max_row}')
+        for cell in cells:
+            r = cell.row
+            if r in updates_dict:
+                if cell.col == 5 and 'wrong' in updates_dict[r]:
+                    cell.value = updates_dict[r]['wrong']
+                elif cell.col == 6 and 'order' in updates_dict[r]:
+                    cell.value = updates_dict[r]['order']
+        ws.update_cells(cells)
+
+    # 1. 現在学習中のファイルのデータを準備して一括更新
+    current_updates = {}
     for q_text, data in st.session_state.pending_updates.items():
-        current_ws.update_cell(data['row_num'], 5, data['wrong_count'])
+        upd = {'wrong': data['wrong_count']}
         if data.get('clear_order'):
-            current_ws.update_cell(data['row_num'], 6, 0)
-            
-    # 2. 他のファイルへ「間違えた回数」と「出題順序のクリア」を同期
-    if current_subj != "全問題":
+            upd['order'] = 0
+        current_updates[data['row_num']] = upd
+        
+    try:
+        current_ws = client.open_by_key(SPREADSHEET_KEYS[current_subj]).sheet1
+        batch_update_ef(current_ws, current_updates)
+    except Exception as e:
+        print(f"Update error (current): {e}")
+        
+    # 2. 全ての他のファイルへ一括同期（問題文で合致する行を探して更新）
+    for subj, key in SPREADSHEET_KEYS.items():
+        if subj == current_subj: continue
         try:
-            sync_ws = client.open_by_key(SPREADSHEET_KEYS["全問題"]).sheet1
-            q_col = sync_ws.col_values(2)
+            sync_ws = client.open_by_key(key).sheet1
+            b_col = sync_ws.col_values(2)
+            sync_updates = {}
             for q_text, data in st.session_state.pending_updates.items():
-                if q_text in q_col:
-                    sync_row = q_col.index(q_text) + 1 
-                    sync_ws.update_cell(sync_row, 5, data['wrong_count'])
-                    # 【修正】同期先でも出題順序を必ず0に戻す
+                if q_text in b_col:
+                    row_idx = b_col.index(q_text) + 1
+                    upd = {'wrong': data['wrong_count']}
                     if data.get('clear_order'):
-                        sync_ws.update_cell(sync_row, 6, 0)
-        except Exception:
-            pass 
-    else:
-        remaining = list(st.session_state.pending_updates.keys())
-        for subj_name, subj_key in SPREADSHEET_KEYS.items():
-            if subj_name == "全問題" or not remaining:
-                continue
-            try:
-                sync_ws = client.open_by_key(subj_key).sheet1
-                q_col = sync_ws.col_values(2)
-                found = []
-                for q_text in remaining:
-                    if q_text in q_col:
-                        sync_row = q_col.index(q_text) + 1
-                        sync_ws.update_cell(sync_row, 5, st.session_state.pending_updates[q_text]['wrong_count'])
-                        # 【修正】同期先でも出題順序を必ず0に戻す
-                        if st.session_state.pending_updates[q_text].get('clear_order'):
-                            sync_ws.update_cell(sync_row, 6, 0)
-                        found.append(q_text)
-                for f in found:
-                    remaining.remove(f)
-            except Exception:
-                continue
-                
+                        upd['order'] = 0
+                    sync_updates[row_idx] = upd
+            batch_update_ef(sync_ws, sync_updates)
+        except Exception as e:
+            print(f"Update error (sync): {e}")
+            
     st.session_state.pending_updates = {}
-    # トップ画面に戻った際に最新のセッション状態を再取得させるためキャッシュを削除
     st.session_state.pop('global_resume_df', None)
 
 # --- メインUI ---
@@ -115,40 +116,41 @@ st.title("📝 正誤クイズ学習アプリ")
 # ==========================================
 if st.session_state.stage == 'select_subject':
     
-    # 【新規】アプリ起動時、「全問題」ファイルから全セッションの続きがあるか確認
+    # 起動時、「全問題」ファイルから前回の続きがあるかスキャンする
     if 'global_resume_df' not in st.session_state:
         with st.spinner("過去の学習記録を確認しています..."):
-            client = get_gspread_client()
-            zen_ws = client.open_by_key(SPREADSHEET_KEYS["全問題"]).sheet1
-            zen_df = pd.DataFrame(zen_ws.get_all_records())
-            
-            if '解答' in zen_df.columns and '答え' not in zen_df.columns:
-                zen_df = zen_df.rename(columns={'解答': '答え'})
-            if '出題順序' not in zen_df.columns:
-                zen_df['出題順序'] = 0
-            else:
-                zen_df['出題順序'] = pd.to_numeric(zen_df['出題順序'], errors='coerce').fillna(0).astype(int)
-            if '間違えた回数' not in zen_df.columns:
-                zen_df['間違えた回数'] = 0
-            else:
-                zen_df['間違えた回数'] = pd.to_numeric(zen_df['間違えた回数'], errors='coerce').fillna(0).astype(int)
+            try:
+                client = get_gspread_client()
+                zen_ws = client.open_by_key(SPREADSHEET_KEYS["全問題"]).sheet1
+                zen_df = pd.DataFrame(zen_ws.get_all_records())
                 
-            zen_df['row_num'] = zen_df.index + 2
-            st.session_state.zen_ws = zen_ws
-            # 出題順序が1以上の問題だけを抽出して保存
-            st.session_state.global_resume_df = zen_df[zen_df['出題順序'] > 0].copy()
+                if '解答' in zen_df.columns and '答え' not in zen_df.columns:
+                    zen_df = zen_df.rename(columns={'解答': '答え'})
+                if '出題順序' not in zen_df.columns:
+                    zen_df['出題順序'] = 0
+                else:
+                    zen_df['出題順序'] = pd.to_numeric(zen_df['出題順序'], errors='coerce').fillna(0).astype(int)
+                if '間違えた回数' not in zen_df.columns:
+                    zen_df['間違えた回数'] = 0
+                else:
+                    zen_df['間違えた回数'] = pd.to_numeric(zen_df['間違えた回数'], errors='coerce').fillna(0).astype(int)
+                    
+                zen_df['row_num'] = zen_df.index + 2
+                st.session_state.zen_ws = zen_ws
+                st.session_state.global_resume_df = zen_df[zen_df['出題順序'] > 0].copy()
+            except Exception:
+                st.session_state.global_resume_df = pd.DataFrame()
 
-    # 続きがある場合、トップ画面の最上部に再開ボタンを表示
+    # トップ画面に「続きから再開する」ボタンを表示
     resume_df = st.session_state.global_resume_df
     if len(resume_df) > 0:
         st.success(f"💡 前回中断したセッションの続き（残り {len(resume_df)}問）があります。")
-        if st.button("▶️ 前回の続きから再開する", type="primary", use_container_width=True):
+        if st.button("▶️ 前回の続きから再開する (全問題として再開)", type="primary", use_container_width=True):
             resume_df = resume_df.sort_values(by='出題順序')
             st.session_state.questions = resume_df.to_dict('records')
             st.session_state.current_idx = 0
             st.session_state.answered = False
             st.session_state.pending_updates = {}
-            # 「全問題」シートをベースに再開
             st.session_state.selected_subject_name = "全問題"
             st.session_state.worksheet = st.session_state.zen_ws
             st.session_state.stage = 'quiz'
@@ -209,9 +211,24 @@ elif st.session_state.stage == 'setup':
     df = st.session_state.df
     worksheet = st.session_state.worksheet
     
+    # 選択した科目のシート内でも前回の続きがあるかチェック（ここが漏れていた部分です）
+    resume_df_local = df[df['出題順序'] > 0].copy()
+    if len(resume_df_local) > 0:
+        st.success(f"💡 この科目に前回中断したセッションの続き（残り {len(resume_df_local)}問）があります。")
+        if st.button("▶️ 続きから再開する", type="primary", use_container_width=True):
+            resume_df_local = resume_df_local.sort_values(by='出題順序')
+            st.session_state.questions = resume_df_local.to_dict('records')
+            st.session_state.current_idx = 0
+            st.session_state.answered = False
+            st.session_state.pending_updates = {}
+            st.session_state.stage = 'quiz'
+            st.rerun()
+        st.markdown("---")
+        st.caption("※下の「新規クイズスタート」を押すと、前回の続きは破棄され、新しい出題順序が設定されます。")
+    
     categories = list(df['分野'].dropna().unique())
     selected_categories = st.multiselect(
-        "出題する範囲（単元）を選択してください", 
+        "新規に出題する範囲（単元）を選択してください", 
         options=categories,
         default=None,
         placeholder="クリックして文字検索・複数選択（未選択の場合は全範囲）"
@@ -240,42 +257,30 @@ elif st.session_state.stage == 'setup':
             if len(target_df) == 0:
                 st.warning("条件に一致する問題がありません。")
             else:
-                # 【完全修正】新規スタート時は、全てのファイルの「出題順序」を強制的にリセットして上書きする
                 with st.spinner("古い記録をリセットし、新しい出題順序を全ファイルに同期しています... (数秒かかります)"):
+                    client = get_gspread_client()
                     target_df['出題順序'] = range(1, len(target_df) + 1)
                     new_order_dict = {str(q['問題']).strip(): int(q['出題順序']) for q in target_df.to_dict('records')}
                     
-                    client = get_gspread_client()
-                    
+                    # 6つのファイル全てにおいて、今回選ばれた問題には順番を、それ以外は0(リセット)を一括上書き
                     for subj, key in SPREADSHEET_KEYS.items():
                         try:
                             ws = client.open_by_key(key).sheet1
                             b_col = ws.col_values(2) # B列: 問題
-                            if not b_col: continue
-                            
-                            new_f_col = []
-                            # 1行目(見出し)以降を処理
-                            for idx in range(1, len(b_col)):
-                                q_text = str(b_col[idx]).strip()
-                                # 選ばれた問題には番号を、それ以外は0(リセット)を入れる
-                                if q_text in new_order_dict:
-                                    new_f_col.append(new_order_dict[q_text])
-                                else:
-                                    new_f_col.append(0)
-                                    
-                            if new_f_col:
-                                cell_list = ws.range(f'F2:F{len(new_f_col)+1}')
-                                for i, cell in enumerate(cell_list):
-                                    cell.value = new_f_col[i]
-                                ws.update_cells(cell_list)
-                        except Exception:
+                            if len(b_col) > 1:
+                                f_cells = ws.range(f'F2:F{len(b_col)}')
+                                for i, cell in enumerate(f_cells):
+                                    q_text = str(b_col[i+1]).strip()
+                                    cell.value = new_order_dict.get(q_text, 0)
+                                ws.update_cells(f_cells)
+                        except Exception as e:
+                            print(f"Sync error on new quiz: {e}")
                             continue
                 
                 st.session_state.questions = target_df.to_dict('records')
                 st.session_state.current_idx = 0
                 st.session_state.answered = False
                 st.session_state.pending_updates = {}
-                # スタート時にキャッシュを消しておく
                 st.session_state.pop('global_resume_df', None)
                 st.session_state.stage = 'quiz'
                 st.rerun()
