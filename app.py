@@ -25,25 +25,22 @@ def get_gspread_client():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # Streamlit CloudのSecretsに設定がある場合
         if "gcp_service_account" in st.secrets:
             try:
                 creds_dict = json.loads(st.secrets["gcp_service_account"])
             except Exception as e:
-                return None, f"SecretsのJSON形式が間違っています。余計な文字が入っていないか確認してください。詳細: {e}"
+                return None, f"SecretsのJSON形式が間違っています。詳細: {e}"
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             
-        # ローカル環境（自分のPC等）で動かす場合
         elif os.path.exists(CREDENTIALS_FILE):
             creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
             
-        # どちらも見つからない場合（★ここがエラー原因の特定に役立ちます）
         else:
-            return None, "【エラー】Streamlit Cloudの「Secrets」が設定されていません。今開いているアプリ画面の右下「Manage app」からSettings > Secretsを開き、もう一度鍵を保存してください。"
+            return None, "【エラー】Streamlit Cloudの「Secrets」が設定されていません。Manage app > Settings > Secretsを開き、鍵を保存してください。"
             
         return gspread.authorize(creds), None
     except Exception as e:
-        return None, f"認証処理中に予期せぬエラーが発生しました: {str(e)}"
+        return None, f"認証処理中にエラーが発生しました: {str(e)}"
 
 # --- セッション状態の初期化 ---
 if 'stage' not in st.session_state:
@@ -186,7 +183,6 @@ def save_learning_records():
         st.error(f"保存エラー: {err}")
         return
     
-    # 1. 並列でスプレッドシートに一括保存
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_save_single_sheet, subj, SPREADSHEET_KEYS[subj], updates, client): subj 
                    for subj, updates in st.session_state.pending_updates.items() if updates}
@@ -195,7 +191,6 @@ def save_learning_records():
             if not isinstance(result, bool):
                 st.error(f"保存中にエラー ({subj}): {result}")
 
-    # 2. アプリ内メモリの直接書き換え（次回読み込みカットで0秒推移）
     for subj, updates in st.session_state.pending_updates.items():
         for r, vals in updates.items():
             mask = (st.session_state.all_df['科目'] == subj) & (st.session_state.all_df['row_num'] == r)
@@ -210,18 +205,13 @@ def save_learning_records():
 # --- メインUI ---
 st.title("📝 正誤クイズ学習アプリ")
 
-# ==========================================
-# トップ画面 (stage: home)
-# ==========================================
 if st.session_state.stage == 'home':
-    # 起動時の超軽量・並列スキャン
     if st.session_state.resume_info is None:
         with st.spinner("過去の学習記録を高速スキャンしています..."):
             st.session_state.resume_info = check_resume_state()
             
     resume_info = st.session_state.resume_info
     
-    # --- 続きがある場合 ---
     if resume_info['count'] > 0:
         st.success(f"💡 前回中断したセッションの続き（残り {resume_info['count']}問）があります。")
         if st.button("▶️ 前回の続きから再開する", type="primary", use_container_width=True):
@@ -246,9 +236,6 @@ if st.session_state.stage == 'home':
             st.session_state.stage = 'setup'
             st.rerun()
 
-# ==========================================
-# 設定画面 (stage: setup)
-# ==========================================
 elif st.session_state.stage == 'setup':
     st.subheader("新規クイズの出題範囲設定")
     st.write("各科目から出題したい単元を選んでください。（全問題を選ぶ場合は、全科目の「全単元を出題する」にチェックを入れます）")
@@ -307,17 +294,16 @@ elif st.session_state.stage == 'setup':
                         client, _ = get_gspread_client()
                         target_df['出題順序'] = range(1, len(target_df) + 1)
                         
-                        subj_order_dict = {subj: {} for subj in SPREADSHEET_KEYS.items()}
+                        # 【修正箇所】.items() を .keys() に変更
+                        subj_order_dict = {subj: {} for subj in SPREADSHEET_KEYS.keys()}
                         for _, row in target_df.iterrows():
                             subj_order_dict[row['科目']][row['row_num']] = row['出題順序']
                             
-                        # 1. 並列でスプレッドシートの出題順序をリセット＆記録
                         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                             futures = {executor.submit(_reset_f_col, subj, key, subj_order_dict[subj], client): subj for subj, key in SPREADSHEET_KEYS.items()}
                             for future in concurrent.futures.as_completed(futures):
                                 future.result()
                                 
-                        # 2. アプリ内メモリも書き換え
                         st.session_state.all_df['出題順序'] = 0
                         for subj, orders in subj_order_dict.items():
                             for r, order in orders.items():
@@ -336,9 +322,6 @@ elif st.session_state.stage == 'setup':
             st.session_state.stage = 'home'
             st.rerun()
 
-# ==========================================
-# クイズ画面 (stage: quiz)
-# ==========================================
 elif st.session_state.stage == 'quiz':
     total_q = len(st.session_state.questions)
     current_q_num = st.session_state.current_idx + 1
@@ -416,9 +399,6 @@ elif st.session_state.stage == 'quiz':
         st.session_state.stage = 'home'
         st.rerun()
 
-# ==========================================
-# 結果画面 (stage: result)
-# ==========================================
 elif st.session_state.stage == 'result':
     st.balloons()
     st.subheader("お疲れ様でした！全問終了です。")
