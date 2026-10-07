@@ -4,6 +4,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
 import concurrent.futures
+import os
 
 # --- ページ設定 ---
 st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layout="centered")
@@ -23,14 +24,26 @@ SPREADSHEET_KEYS = {
 def get_gspread_client():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        
+        # Streamlit CloudのSecretsに設定がある場合
         if "gcp_service_account" in st.secrets:
-            creds_dict = json.loads(st.secrets["gcp_service_account"])
+            try:
+                creds_dict = json.loads(st.secrets["gcp_service_account"])
+            except Exception as e:
+                return None, f"SecretsのJSON形式が間違っています。余計な文字が入っていないか確認してください。詳細: {e}"
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        else:
+            
+        # ローカル環境（自分のPC等）で動かす場合
+        elif os.path.exists(CREDENTIALS_FILE):
             creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+            
+        # どちらも見つからない場合（★ここがエラー原因の特定に役立ちます）
+        else:
+            return None, "【エラー】Streamlit Cloudの「Secrets」が設定されていません。今開いているアプリ画面の右下「Manage app」からSettings > Secretsを開き、もう一度鍵を保存してください。"
+            
         return gspread.authorize(creds), None
     except Exception as e:
-        return None, f"認証エラーが発生しました: {str(e)}"
+        return None, f"認証処理中に予期せぬエラーが発生しました: {str(e)}"
 
 # --- セッション状態の初期化 ---
 if 'stage' not in st.session_state:
@@ -201,7 +214,7 @@ st.title("📝 正誤クイズ学習アプリ")
 # トップ画面 (stage: home)
 # ==========================================
 if st.session_state.stage == 'home':
-    # 起動時の超軽量・並列スキャン（自動）
+    # 起動時の超軽量・並列スキャン
     if st.session_state.resume_info is None:
         with st.spinner("過去の学習記録を高速スキャンしています..."):
             st.session_state.resume_info = check_resume_state()
