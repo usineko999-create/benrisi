@@ -3,7 +3,7 @@ import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-import concurrent.futures # 【追加】並列処理のためのライブラリ
+import concurrent.futures
 
 # --- ページ設定 ---
 st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layout="centered")
@@ -78,7 +78,6 @@ def load_all_data():
     client = get_gspread_client()
     all_data = []
     
-    # 最大5つの通信を「同時に」走らせる
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(load_single_sheet, subj, key, client): subj for subj, key in SPREADSHEET_KEYS.items()}
         for future in concurrent.futures.as_completed(futures):
@@ -104,7 +103,6 @@ def save_learning_records():
         
     client = get_gspread_client()
     
-    # 1. スプレッドシートへの保存処理を実行する関数
     def update_sheet(subj, updates):
         try:
             ws = client.open_by_key(SPREADSHEET_KEYS[subj]).sheet1
@@ -123,13 +121,11 @@ def save_learning_records():
         except Exception as e:
             return e
 
-    # 対象となる科目だけ並列で保存する
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(update_sheet, subj, updates): subj for subj, updates in st.session_state.pending_updates.items() if updates}
         for future in concurrent.futures.as_completed(futures):
-            future.result() # エラーハンドリングは省略（裏側で実行）
+            future.result() 
     
-    # 2. 【重要】通信して読み直さず、アプリ内のデータを直接書き換える
     for subj, updates in st.session_state.pending_updates.items():
         for r, vals in updates.items():
             mask = (st.session_state.all_df['科目'] == subj) & (st.session_state.all_df['row_num'] == r)
@@ -139,7 +135,6 @@ def save_learning_records():
                 st.session_state.all_df.loc[mask, '出題順序'] = vals['order']
                 
     st.session_state.pending_updates = {}
-    # ※ data_loaded は True のまま維持（次回トップ画面の表示が一瞬になります）
 
 # --- メインUI ---
 st.title("📝 正誤クイズ学習アプリ")
@@ -226,7 +221,6 @@ if st.session_state.stage == 'setup':
                     for _, row in target_df.iterrows():
                         subj_order_dict[row['科目']][row['row_num']] = row['出題順序']
                         
-                    # 1. スプレッドシートを並列で一気にリセット＆記録
                     def reset_and_save(subj, key, orders):
                         try:
                             ws = client.open_by_key(key).sheet1
@@ -246,7 +240,6 @@ if st.session_state.stage == 'setup':
                         for future in concurrent.futures.as_completed(futures):
                             future.result()
                     
-                    # 2. アプリ内メモリも書き換える（読み込みカット）
                     st.session_state.all_df['出題順序'] = 0
                     for subj, orders in subj_order_dict.items():
                         for r, order in orders.items():
@@ -277,6 +270,8 @@ elif st.session_state.stage == 'quiz':
     
     def check_answer(user_ans):
         correct_ans = str(current_q['答え']).strip()
+        # 「わからない」が選ばれた場合も、正しい答え（「正しい」や「誤り」）と一致しないため
+        # 自動的に is_correct = False（不正解）となります。
         is_correct = (user_ans == correct_ans)
         st.session_state.is_correct = is_correct
         
@@ -298,8 +293,11 @@ elif st.session_state.stage == 'quiz':
             
         st.session_state.answered = True
 
+    # ----------------------------------------
+    # 【変更箇所】解答ボタンを3列にして「わからない」を追加
+    # ----------------------------------------
     if not st.session_state.answered:
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("正しい ⭕️", use_container_width=True):
                 check_answer("正しい")
@@ -307,6 +305,10 @@ elif st.session_state.stage == 'quiz':
         with col2:
             if st.button("誤り ❌", use_container_width=True):
                 check_answer("誤り")
+                st.rerun()
+        with col3:
+            if st.button("わからない 🤷", use_container_width=True):
+                check_answer("わからない")
                 st.rerun()
                 
     else:
