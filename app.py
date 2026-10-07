@@ -18,15 +18,21 @@ SPREADSHEET_KEYS = {
     "不正競争・著作権": "1w9AITUq-3HF53slPwFr83jOhws3kmVVy6dOfqHFHN9c"
 }
 
+# 【安全装置】エラー時にクラッシュさせず、メッセージを返すように改良
 @st.cache_resource
 def get_gspread_client():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    if "gcp_service_account" in st.secrets:
-        creds_dict = json.loads(st.secrets["gcp_service_account"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-    return gspread.authorize(creds)
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        if "gcp_service_account" in st.secrets:
+            # Secretsから読み込み
+            creds_dict = json.loads(st.secrets["gcp_service_account"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        else:
+            # ローカルファイルから読み込み
+            creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+        return gspread.authorize(creds), None
+    except Exception as e:
+        return None, f"認証エラーが発生しました: {str(e)}"
 
 # --- セッション状態の初期化 ---
 if 'stage' not in st.session_state:
@@ -47,63 +53,62 @@ if 'pending_updates' not in st.session_state:
     st.session_state.pending_updates = {}
 
 # ==========================================
-# 起動時の超軽量スキャン（続きがあるかF列だけを確認）
+# 起動時の超軽量スキャン（安全版）
 # ==========================================
 def check_resume_state():
-    client = get_gspread_client()
+    client, err = get_gspread_client()
+    if err:
+        st.error(f"⚠️ 【システムエラー】Google APIとの接続に失敗しました。\n詳細: {err}")
+        return {'count': 0, 'subjects': []}
+        
     total_resume_count = 0
     resume_subjects = []
     
     for subj, key in SPREADSHEET_KEYS.items():
         try:
             ws = client.open_by_key(key).sheet1
-            # F列(6列目)の出題順序だけを取得（メモリ消費ほぼゼロ）
             f_col = ws.col_values(6)
             count = sum(1 for val in f_col[1:] if str(val).strip().isdigit() and int(val) > 0)
             if count > 0:
                 total_resume_count += count
                 resume_subjects.append(subj)
-        except Exception:
-            pass
+        except Exception as e:
+            st.warning(f"⚠️ 「{subj}」の確認中にエラーが出ました: {e}")
             
     return {'count': total_resume_count, 'subjects': resume_subjects}
 
 # ==========================================
-# データを安全に読み込む処理（空行カットによるメモリ節約）
+# データを安全に読み込む処理
 # ==========================================
 def load_data(subjects_to_load):
-    client = get_gspread_client()
+    client, err = get_gspread_client()
+    if err:
+        st.error(f"⚠️ 接続エラー: {err}")
+        return
+        
     all_data = []
-    
     for subj in subjects_to_load:
         try:
             key = SPREADSHEET_KEYS[subj]
             ws = client.open_by_key(key).sheet1
-            # get_all_records() は使わず、get_all_values() で取得して空行をカット
             data = ws.get_all_values()
             if len(data) > 1:
                 headers = data[0]
                 df = pd.DataFrame(data[1:], columns=headers)
                 
-                # 表記揺れの吸収
                 if '子フォルダ名' in df.columns: df = df.rename(columns={'子フォルダ名': '分野'})
                 if '解答' in df.columns: df = df.rename(columns={'解答': '答え'})
-                
-                # 「問題」列が空の行（余分な空白行）を完全に削除してメモリを節約
-                if '問題' in df.columns:
-                    df = df[df['問題'].astype(str).str.strip() != '']
-                
+                if '問題' in df.columns: df = df[df['問題'].astype(str).str.strip() != '']
                 if '間違えた回数' not in df.columns: df['間違えた回数'] = 0
                 if '出題順序' not in df.columns: df['出題順序'] = 0
                 
                 df['間違えた回数'] = pd.to_numeric(df['間違えた回数'], errors='coerce').fillna(0).astype(int)
                 df['出題順序'] = pd.to_numeric(df['出題順序'], errors='coerce').fillna(0).astype(int)
-                
                 df['row_num'] = df.index + 2
                 df['科目'] = subj
                 all_data.append(df)
         except Exception as e:
-            st.error(f"「{subj}」の読み込みに失敗しました: {e}")
+            st.error(f"「{subj}」の読み込みに失敗: {e}")
             
     if all_data:
         st.session_state.all_df = pd.concat(all_data, ignore_index=True)
@@ -117,7 +122,10 @@ def save_learning_records():
     if not st.session_state.pending_updates:
         return
         
-    client = get_gspread_client()
+    client, err = get_gspread_client()
+    if err:
+        st.error(f"保存エラー: {err}")
+        return
     
     for subj, updates in st.session_state.pending_updates.items():
         if not updates: continue
@@ -135,10 +143,9 @@ def save_learning_records():
                         cell.value = updates[r]['order']
             ws.update_cells(cells)
         except Exception as e:
-            print(f"Update error in {subj}: {e}")
+            st.error(f"保存中にエラー: {e}")
             
     st.session_state.pending_updates = {}
-    # 保存完了後はキャッシュしている再開情報をリセット（次回トップ画面で再スキャンさせる）
     st.session_state.resume_info = None
 
 # --- メインUI ---
@@ -148,38 +155,41 @@ st.title("📝 正誤クイズ学習アプリ")
 # トップ画面 (stage: home)
 # ==========================================
 if st.session_state.stage == 'home':
-    # 起動時の超軽量スキャン
+    # アプリ起動時に自動で通信せず、ボタンを押して確認するように変更
     if st.session_state.resume_info is None:
-        with st.spinner("前回の学習記録を確認しています..."):
-            st.session_state.resume_info = check_resume_state()
-            
-    resume_info = st.session_state.resume_info
-    
-    # --- 続きがある場合 ---
-    if resume_info['count'] > 0:
-        st.success(f"💡 前回中断したセッションの続き（残り {resume_info['count']}問）があります。")
-        if st.button("▶️ 前回の続きから再開する", type="primary", use_container_width=True):
-            with st.spinner("続きの問題データを読み込んでいます..."):
-                # 続きがある科目だけをロード
-                load_data(resume_info['subjects'])
-                df = st.session_state.all_df
-                resume_df = df[df['出題順序'] > 0].sort_values(by='出題順序')
-                
-                st.session_state.questions = resume_df.to_dict('records')
-                st.session_state.current_idx = 0
-                st.session_state.answered = False
-                st.session_state.pending_updates = {}
-                st.session_state.stage = 'quiz'
-                st.rerun()
-        st.markdown("---")
-        
-    st.subheader("新規クイズを作成する")
-    st.caption("※新しいクイズを作成すると、前回の続きは破棄されます。")
-    if st.button("🆕 新規クイズの設定画面へ進む"):
-        with st.spinner("全科目の出題データを準備しています..."):
-            load_data(list(SPREADSHEET_KEYS.keys()))
-            st.session_state.stage = 'setup'
+        st.info("システムは正常に起動しました。過去の記録を確認して開始してください。")
+        if st.button("🔄 過去の学習記録を確認してスタート", type="primary", use_container_width=True):
+            with st.spinner("スプレッドシートと通信しています..."):
+                st.session_state.resume_info = check_resume_state()
             st.rerun()
+            
+    else:
+        resume_info = st.session_state.resume_info
+        
+        # --- 続きがある場合 ---
+        if resume_info['count'] > 0:
+            st.success(f"💡 前回中断したセッションの続き（残り {resume_info['count']}問）があります。")
+            if st.button("▶️ 前回の続きから再開する", type="primary", use_container_width=True):
+                with st.spinner("続きの問題データを読み込んでいます..."):
+                    load_data(resume_info['subjects'])
+                    df = st.session_state.all_df
+                    resume_df = df[df['出題順序'] > 0].sort_values(by='出題順序')
+                    
+                    st.session_state.questions = resume_df.to_dict('records')
+                    st.session_state.current_idx = 0
+                    st.session_state.answered = False
+                    st.session_state.pending_updates = {}
+                    st.session_state.stage = 'quiz'
+                    st.rerun()
+            st.markdown("---")
+            
+        st.subheader("新規クイズを作成する")
+        st.caption("※新しいクイズを作成すると、前回の続きは破棄されます。")
+        if st.button("🆕 新規クイズの設定画面へ進む"):
+            with st.spinner("全科目の出題データを準備しています..."):
+                load_data(list(SPREADSHEET_KEYS.keys()))
+                st.session_state.stage = 'setup'
+                st.rerun()
 
 # ==========================================
 # 設定画面 (stage: setup)
@@ -239,14 +249,13 @@ elif st.session_state.stage == 'setup':
                     st.warning("選択した範囲の中に、条件に一致する問題がありません。")
                 else:
                     with st.spinner("古い記録をリセットし、新しい出題順序を記録しています..."):
-                        client = get_gspread_client()
+                        client, _ = get_gspread_client()
                         target_df['出題順序'] = range(1, len(target_df) + 1)
                         
-                        subj_order_dict = {subj: {} for subj in SPREADSHEET_KEYS.keys()}
+                        subj_order_dict = {subj: {} for subj in SPREADSHEET_KEYS.items()}
                         for _, row in target_df.iterrows():
                             subj_order_dict[row['科目']][row['row_num']] = row['出題順序']
                             
-                        # スプレッドシートの出題順序をリセット
                         for subj, key in SPREADSHEET_KEYS.items():
                             try:
                                 ws = client.open_by_key(key).sheet1
@@ -291,7 +300,6 @@ elif st.session_state.stage == 'quiz':
     
     def check_answer(user_ans):
         correct_ans = str(current_q['答え']).strip()
-        # 「わからない」が選ばれた場合も不正解扱いとなります
         is_correct = (user_ans == correct_ans)
         st.session_state.is_correct = is_correct
         
