@@ -77,8 +77,15 @@ def _load_single_sheet_data(subj, key, client):
         ws = client.open_by_key(key).sheet1
         data = ws.get_all_values()
         if len(data) > 1:
-            headers = data[0]
+            # ヘッダーの空白を削除（表記揺れ対策）
+            headers = [str(h).strip() for h in data[0]]
             df = pd.DataFrame(data[1:], columns=headers)
+            
+            # 1行目が空欄の場合の自動修復機能（E列=間違えた回数, F列=出題順序）
+            col_names = list(df.columns)
+            if len(col_names) >= 5 and col_names[4] == "": col_names[4] = "間違えた回数"
+            if len(col_names) >= 6 and col_names[5] == "": col_names[5] = "出題順序"
+            df.columns = col_names
             
             if '子フォルダ名' in df.columns: df = df.rename(columns={'子フォルダ名': '分野'})
             if '解答' in df.columns: df = df.rename(columns={'解答': '答え'})
@@ -294,120 +301,8 @@ elif st.session_state.stage == 'setup':
                         client, _ = get_gspread_client()
                         target_df['出題順序'] = range(1, len(target_df) + 1)
                         
-                        # 【修正箇所】.items() を .keys() に変更
                         subj_order_dict = {subj: {} for subj in SPREADSHEET_KEYS.keys()}
                         for _, row in target_df.iterrows():
                             subj_order_dict[row['科目']][row['row_num']] = row['出題順序']
                             
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                            futures = {executor.submit(_reset_f_col, subj, key, subj_order_dict[subj], client): subj for subj, key in SPREADSHEET_KEYS.items()}
-                            for future in concurrent.futures.as_completed(futures):
-                                future.result()
-                                
-                        st.session_state.all_df['出題順序'] = 0
-                        for subj, orders in subj_order_dict.items():
-                            for r, order in orders.items():
-                                mask = (st.session_state.all_df['科目'] == subj) & (st.session_state.all_df['row_num'] == r)
-                                st.session_state.all_df.loc[mask, '出題順序'] = order
-                        
-                    st.session_state.questions = target_df.to_dict('records')
-                    st.session_state.current_idx = 0
-                    st.session_state.answered = False
-                    st.session_state.pending_updates = {}
-                    st.session_state.stage = 'quiz'
-                    st.rerun()
-                    
-    with col2:
-        if st.button("🔙 トップ画面に戻る"):
-            st.session_state.stage = 'home'
-            st.rerun()
-
-elif st.session_state.stage == 'quiz':
-    total_q = len(st.session_state.questions)
-    current_q_num = st.session_state.current_idx + 1
-    
-    st.progress(current_q_num / total_q)
-    st.caption(f"問題 {current_q_num} / {total_q}")
-    
-    current_q = st.session_state.questions[st.session_state.current_idx]
-    
-    st.markdown(f"**【{current_q['科目']} - {current_q['分野']}】**")
-    st.subheader(current_q['問題'])
-    
-    def check_answer(user_ans):
-        correct_ans = str(current_q['答え']).strip()
-        is_correct = (user_ans == correct_ans)
-        st.session_state.is_correct = is_correct
-        
-        row = int(current_q['row_num'])
-        subj = current_q['科目']
-        current_wrong_count = int(current_q['間違えた回数'])
-        
-        if not is_correct:
-            current_wrong_count += 1
-            st.session_state.questions[st.session_state.current_idx]['間違えた回数'] = current_wrong_count
-            
-        if subj not in st.session_state.pending_updates:
-            st.session_state.pending_updates[subj] = {}
-            
-        st.session_state.pending_updates[subj][row] = {
-            'wrong': current_wrong_count,
-            'order': 0 
-        }
-            
-        st.session_state.answered = True
-
-    if not st.session_state.answered:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("正しい ⭕️", use_container_width=True):
-                check_answer("正しい")
-                st.rerun()
-        with col2:
-            if st.button("誤り ❌", use_container_width=True):
-                check_answer("誤り")
-                st.rerun()
-        with col3:
-            if st.button("わからない 🤷", use_container_width=True):
-                check_answer("わからない")
-                st.rerun()
-                
-    else:
-        if st.session_state.is_correct:
-            st.success("🎉 正解！")
-        else:
-            st.error("💦 不正解...")
-            st.caption(f"※この問題を間違えた回数: {current_q['間違えた回数']}回")
-            
-        st.info(f"**【解説】**\n\n{current_q['解説']}")
-        
-        if current_q_num < total_q:
-            if st.button("次の問題へ ➔", type="primary"):
-                st.session_state.current_idx += 1
-                st.session_state.answered = False
-                st.rerun()
-        else:
-            if st.button("結果画面へ", type="primary"):
-                st.session_state.stage = 'result'
-                st.rerun()
-
-    st.markdown("---")
-    if st.button("⏸️ 中断して経過を保存", use_container_width=True):
-        if st.session_state.pending_updates:
-            with st.spinner("学習記録を超高速で保存しています..."):
-                save_learning_records()
-        st.session_state.stage = 'home'
-        st.rerun()
-
-elif st.session_state.stage == 'result':
-    st.balloons()
-    st.subheader("お疲れ様でした！全問終了です。")
-    
-    if st.session_state.pending_updates:
-        with st.spinner("学習記録を超高速で保存しています..."):
-            save_learning_records()
-        st.success("すべての学習記録が保存されました！")
-        
-    if st.button("トップ画面に戻る"):
-        st.session_state.stage = 'home'
-        st.rerun()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=5
