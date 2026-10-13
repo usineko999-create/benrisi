@@ -5,6 +5,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import concurrent.futures
 import os
+import streamlit.components.v1 as components # 【追加】自動スクロール用
 
 # --- ページ設定 ---
 st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layout="centered")
@@ -77,11 +78,9 @@ def _load_single_sheet_data(subj, key, client):
         ws = client.open_by_key(key).sheet1
         data = ws.get_all_values()
         if len(data) > 1:
-            # ヘッダーの空白を削除（表記揺れ対策）
             headers = [str(h).strip() for h in data[0]]
             df = pd.DataFrame(data[1:], columns=headers)
             
-            # 1行目が空欄の場合の自動修復機能（E列=間違えた回数, F列=出題順序）
             col_names = list(df.columns)
             if len(col_names) >= 5 and col_names[4] == "": col_names[4] = "間違えた回数"
             if len(col_names) >= 6 and col_names[5] == "": col_names[5] = "出題順序"
@@ -331,7 +330,6 @@ elif st.session_state.stage == 'setup':
 elif st.session_state.stage == 'quiz':
     total_q = len(st.session_state.questions)
     
-    # ゼロディビジョンエラーの完全防御処理
     if total_q == 0:
         st.warning("⚠️ 再開できる問題データが見つかりませんでした。（データがリセットされた可能性があります）")
         if st.button("トップ画面に戻る", type="primary"):
@@ -339,6 +337,17 @@ elif st.session_state.stage == 'quiz':
             st.session_state.resume_info = None
             st.rerun()
     else:
+        # 【追加】新しい問題が表示された際、強制的に画面のトップにスクロールする機能
+        if not st.session_state.answered:
+            components.html(
+                """
+                <script>
+                    window.parent.document.querySelector('.main').scrollTop = 0;
+                </script>
+                """,
+                height=0
+            )
+
         current_q_num = st.session_state.current_idx + 1
         
         st.progress(current_q_num / total_q)
@@ -396,20 +405,29 @@ elif st.session_state.stage == 'quiz':
                 
             st.info(f"**【解説】**\n\n{current_q['解説']}")
             
+            # 【変更】次の問題へ行くタイミングで「自動保存」を実行する
             if current_q_num < total_q:
                 if st.button("次の問題へ ➔", type="primary"):
+                    if st.session_state.pending_updates:
+                        with st.spinner("記録を保存しています..."):
+                            save_learning_records()
                     st.session_state.current_idx += 1
                     st.session_state.answered = False
                     st.rerun()
             else:
                 if st.button("結果画面へ", type="primary"):
+                    if st.session_state.pending_updates:
+                        with st.spinner("記録を保存しています..."):
+                            save_learning_records()
                     st.session_state.stage = 'result'
                     st.rerun()
 
         st.markdown("---")
-        if st.button("⏸️ 中断して経過を保存", use_container_width=True):
+        # 次の問題ボタンで都度保存されるようになったため、こちらは「中断してトップ画面に戻る」ボタンとして機能させます。
+        # （※解答後に「次の問題へ」を押さずに中断した場合も、記録が漏れないよう保存処理を走らせます）
+        if st.button("⏸️ 中断してトップ画面に戻る", use_container_width=True):
             if st.session_state.pending_updates:
-                with st.spinner("学習記録を超高速で保存しています..."):
+                with st.spinner("記録を保存して終了しています..."):
                     save_learning_records()
             st.session_state.stage = 'home'
             st.rerun()
@@ -418,11 +436,6 @@ elif st.session_state.stage == 'result':
     st.balloons()
     st.subheader("お疲れ様でした！全問終了です。")
     
-    if st.session_state.pending_updates:
-        with st.spinner("学習記録を超高速で保存しています..."):
-            save_learning_records()
-        st.success("すべての学習記録が保存されました！")
-        
     if st.button("トップ画面に戻る"):
         st.session_state.stage = 'home'
         st.rerun()
