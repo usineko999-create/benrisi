@@ -5,7 +5,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import concurrent.futures
 import os
-import streamlit.components.v1 as components # 【追加】自動スクロール用
+import streamlit.components.v1 as components
 
 # --- ページ設定 ---
 st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layout="centered")
@@ -127,7 +127,8 @@ def _reset_f_col(subj, key, orders, client):
             f_cells = ws.range(f'F2:F{num_rows}')
             for cell in f_cells:
                 r = cell.row
-                cell.value = orders.get(r, 0)
+                # 【修正箇所】0ではなく空欄（""）にする
+                cell.value = orders.get(r, "")
             ws.update_cells(f_cells)
         return True
     except Exception:
@@ -203,7 +204,8 @@ def save_learning_records():
             if 'wrong' in vals:
                 st.session_state.all_df.loc[mask, '間違えた回数'] = vals['wrong']
             if 'order' in vals:
-                st.session_state.all_df.loc[mask, '出題順序'] = vals['order']
+                # メモリ上では計算エラーを防ぐために数値の0として扱います
+                st.session_state.all_df.loc[mask, '出題順序'] = 0 if vals['order'] == "" else vals['order']
             
     st.session_state.pending_updates = {}
     st.session_state.resume_info = None
@@ -337,7 +339,6 @@ elif st.session_state.stage == 'quiz':
             st.session_state.resume_info = None
             st.rerun()
     else:
-        # 【追加】新しい問題が表示された際、強制的に画面のトップにスクロールする機能
         if not st.session_state.answered:
             components.html(
                 """
@@ -376,7 +377,8 @@ elif st.session_state.stage == 'quiz':
                 
             st.session_state.pending_updates[subj][row] = {
                 'wrong': current_wrong_count,
-                'order': 0 
+                # 【修正箇所】0ではなく空欄（""）としてスプレッドシートに渡す
+                'order': "" 
             }
                 
             st.session_state.answered = True
@@ -405,7 +407,6 @@ elif st.session_state.stage == 'quiz':
                 
             st.info(f"**【解説】**\n\n{current_q['解説']}")
             
-            # 【変更】次の問題へ行くタイミングで「自動保存」を実行する
             if current_q_num < total_q:
                 if st.button("次の問題へ ➔", type="primary"):
                     if st.session_state.pending_updates:
@@ -423,8 +424,6 @@ elif st.session_state.stage == 'quiz':
                     st.rerun()
 
         st.markdown("---")
-        # 次の問題ボタンで都度保存されるようになったため、こちらは「中断してトップ画面に戻る」ボタンとして機能させます。
-        # （※解答後に「次の問題へ」を押さずに中断した場合も、記録が漏れないよう保存処理を走らせます）
         if st.button("⏸️ 中断してトップ画面に戻る", use_container_width=True):
             if st.session_state.pending_updates:
                 with st.spinner("記録を保存して終了しています..."):
