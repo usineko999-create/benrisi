@@ -6,6 +6,7 @@ import json
 import concurrent.futures
 import os
 import unicodedata
+from collections.abc import Mapping
 import streamlit.components.v1 as components
 
 # --- 文字列比較用のNFC正規化ヘルパー関数 ---
@@ -24,31 +25,118 @@ CREDENTIALS_FILE = "secret_key.json"
 # 【重要】ここの単元名と文字列を、ご自身のスプレッドシートのキーに書き換えてください
 SPREADSHEET_KEYS = {
     "語呂合わせ_特許・実用新案": "1GOA12mzr6yWzm1Cdu-TMmnQdZ_Y8goV5I5MT9IcPKLw"
-
 }
 
 @st.cache_resource
+def _authorize_cached_client(creds_json_str):
+    """認証に成功したクライアントのみをキャッシュする内部関数（エラーをキャッシュさせない）"""
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_dict = json.loads(creds_json_str)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    return gspread.authorize(creds)
+
 def get_gspread_client():
+    """
+    Google APIクライアントを取得する。
+    エラー発生時はキャッシュせず、原因を確実に特定できる詳細なデバッグ診断情報を返す。
+    """
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    debug_notes = []
+
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        
-        if "gcp_service_account" in st.secrets:
-            try:
-                creds_dict = json.loads(st.secrets["gcp_service_account"])
-            except Exception as e:
-                return None, f"SecretsのJSON形式が間違っています。詳細: {e}"
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            
-        elif os.path.exists(CREDENTIALS_FILE):
-            # ファイル操作には正規化前の元のパス文字列(CREDENTIALS_FILE)をそのまま使用
+        # 1. st.secrets の読み取りとキー一覧の診断
+        secret_keys = []
+        secrets_accessible = False
+        try:
+            secret_keys = list(st.secrets.keys())
+            secrets_accessible = True
+            debug_notes.append(f"st.secrets 内で検出されたキー一覧: {secret_keys if secret_keys else 'なし（空）'}")
+        except Exception as se:
+            debug_notes.append(f"st.secrets へのアクセス時に例外が発生: {type(se).__name__}: {se}")
+
+        # NFC正規化を用いて 'gcp_service_account' キーを検索（前後の空白や全角スペース混入等も考慮）
+        target_key_nfc = normalize_nfc("gcp_service_account")
+        matched_secret_key = None
+        if secrets_accessible:
+            for k in secret_keys:
+                if normalize_nfc(k).strip() == target_key_nfc:
+                    matched_secret_key = k
+                    break
+
+        if matched_secret_key is not None:
+            raw_val = st.secrets[matched_secret_key]
+            debug_notes.append(f"対象キー '{matched_secret_key}' のデータ型: {type(raw_val).__name__}")
+
+            creds_dict = None
+            # ケースA: TOMLセクション等として既に辞書型（Mapping）で格納されている場合
+            if isinstance(raw_val, Mapping):
+                creds_dict = dict(raw_val)
+            # ケースB: 文字列（''' { ... } '''）として格納されている場合
+            else:
+                raw_str = str(raw_val)
+                debug_notes.append(f"文字列長: {len(raw_str)} 文字")
+                # ノーブレークスペース(\u00a0)やBOM(\ufeff)が混入している場合は除去・置換
+                cleaned_str = raw_str.replace('\u00a0', ' ').replace('\ufeff', '').strip()
+
+                try:
+                    creds_dict = json.loads(cleaned_str)
+                except json.JSONDecodeError as je:
+                    # 秘密鍵内の実際の改行コードが原因でパースエラーになる場合の自動補正試行
+                    try:
+                        creds_dict = json.loads(cleaned_str, strict=False)
+                    except Exception as je2:
+                        err_pos = getattr(je, 'pos', 0)
+                        snippet = cleaned_str[max(0, err_pos - 25):min(len(cleaned_str), err_pos + 25)]
+                        return None, (
+                            f"SecretsのJSON形式の解析に失敗しました。\n"
+                            f"- **エラー箇所**: {je.lineno}行目 {je.colno}文字目付近 (`{je.msg}`)\n"
+                            f"- **該当箇所の前後**: `{ repr(snippet) }`\n"
+                            f"- **診断ログ**: {' / '.join(debug_notes)}"
+                        )
+
+            # 必須キーの確認と秘密鍵内の "\\n" エスケープ補正
+            if isinstance(creds_dict, dict):
+                if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
+                    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+                normalized_json_str = json.dumps(creds_dict, ensure_ascii=False, sort_keys=True)
+                client = _authorize_cached_client(normalized_json_str)
+                return client, None
+
+        # ケースC: トップレベルに直接 type="service_account" 等が書かれている場合
+        elif secrets_accessible and any(normalize_nfc(k).strip() == normalize_nfc("private_key") for k in secret_keys):
+            debug_notes.append("トップレベルに直接サービスアカウント情報が検出されました。")
+            creds_dict = {str(k).strip(): st.secrets[k] for k in secret_keys}
+            if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            normalized_json_str = json.dumps(creds_dict, ensure_ascii=False, sort_keys=True)
+            client = _authorize_cached_client(normalized_json_str)
+            return client, None
+
+        # 2. ローカルファイル (CREDENTIALS_FILE) の確認
+        # ファイル操作には正規化前の元のパス文字列(CREDENTIALS_FILE)をそのまま使用
+        if os.path.exists(CREDENTIALS_FILE):
             creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-            
+            return gspread.authorize(creds), None
         else:
-            return None, "【エラー】Streamlit Cloudの「Secrets」が設定されていません。Manage app > Settings > Secretsを開き、鍵を保存してください。"
-            
-        return gspread.authorize(creds), None
+            debug_notes.append(f"ローカルファイル '{CREDENTIALS_FILE}' の存在: False (カレントディレクトリ: {os.getcwd()})")
+
+        # 3. どちらも見つからない場合の詳細デバッグメッセージ生成
+        return None, (
+            "【エラー】Streamlit Cloudの「Secrets」から `gcp_service_account` を読み取れませんでした。\n\n"
+            "**🔍 【原因特定の診断結果】**\n"
+            + "\n".join(f"- {note}" for note in debug_notes) + "\n\n"
+            "**💡 【確認・対処手順】**\n"
+            "1. **特殊空白文字の除去**: Secretsに貼り付けたテキスト内に特殊空白（ノーブレークスペース等）が含まれていると、TOML全体の読み込みが失敗してキー一覧が「なし（空）」になります。クリーンな半角スペースのテキストを貼り直して「Save」を押してください。\n"
+            "2. **設定先アプリの確認**: 「正誤クイズアプリ」と「暗記リストアプリ」でURLが異なる場合、現在開いているアプリ側の `Manage app ＞ Settings ＞ Secrets` に鍵が保存されているか確認してください。\n"
+            "3. **キャッシュのクリア**: Secrets保存直後の場合は、下の「🔄 認証キャッシュをクリアして再接続」ボタンを押してください。"
+        )
+
     except Exception as e:
-        return None, f"認証処理中にエラーが発生しました: {str(e)}"
+        return None, (
+            f"認証処理中に予期せぬエラーが発生しました: `{type(e).__name__}: {str(e)}`\n"
+            f"- **診断ログ**: {' / '.join(debug_notes)}"
+        )
 
 # --- セッション状態の初期化 ---
 if 'stage' not in st.session_state:
@@ -310,7 +398,11 @@ def _reset_order_col(subj, key, orders, col_meta, client):
 def check_resume_state():
     client, err = get_gspread_client()
     if err:
-        st.error(f"⚠️ 【システムエラー】Google APIとの接続に失敗しました。\n詳細: {err}")
+        st.error(f"⚠️ 【システムエラー】Google APIとの接続に失敗しました。\n\n{err}")
+        if st.button("🔄 認証キャッシュをクリアして再接続"):
+            st.cache_resource.clear()
+            st.session_state.resume_info = None
+            st.rerun()
         return {'count': 0, 'subjects': []}
         
     total_resume_count = 0
@@ -332,7 +424,7 @@ def check_resume_state():
 def load_data(subjects_to_load):
     client, err = get_gspread_client()
     if err:
-        st.error(f"⚠️ 接続エラー: {err}")
+        st.error(f"⚠️ 接続エラー:\n\n{err}")
         for subj in subjects_to_load:
             st.session_state.load_debug_info[subj] = {
                 'status': 'auth_error',
@@ -370,7 +462,7 @@ def save_learning_records():
         
     client, err = get_gspread_client()
     if err:
-        st.error(f"保存エラー: {err}")
+        st.error(f"保存エラー:\n\n{err}")
         return
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -426,7 +518,7 @@ def _render_debug_message(subj):
             f"- **エラー詳細**: `{err_msg}`\n"
             f"- **指定されたキー**: `{key_val}`\n\n"
             f"**💡 対処方法**:\n"
-            f"1. `PermissionError` や `APIError(403)` 等が出る場合：対象のスプレッドシートの右上「共有」ボタンから、**サービスアカウントのメールアドレス（`〜@〜.iam.gserviceaccount.com`）を「編集者」として追加**してください。\n"
+            f"1. `PermissionError` や `APIError(403)` 等が出る場合：対象のスプレッドシートの右上「共有」ボタンから、**サービスアカウントのメールアドレス（`google-drive-api@gen-lang-client-0840508964.iam.gserviceaccount.com`）を「編集者」として追加**してください。\n"
             f"2. `SpreadsheetNotFound` や `404` 等が出る場合：`SPREADSHEET_KEYS` に設定したシートのキー（ID文字列）に誤りがないか確認してください。"
         )
     elif status == 'no_data_rows':
@@ -446,7 +538,7 @@ def _render_debug_message(subj):
             f"**💡 対処方法**: 1行目（ヘッダー行）が空欄になっていないか確認してください。1行目にタイトル行や空行があり、2行目以降にラベル名（分野など）がある場合は、1行目がラベル名になるよう上部の不要な行を削除してください。"
         )
     elif status == 'auth_error':
-        st.error(f"🔍 **【原因診断：{subj}】認証エラー**: `{info.get('error_msg')}`")
+        st.error(f"🔍 **【原因診断：{subj}】認証エラー**:\n\n{info.get('error_msg')}")
     else:
         st.info(
             f"🔍 **【原因診断：{subj}】詳細ステータス**: `{info}`"
@@ -490,7 +582,8 @@ elif st.session_state.stage == 'setup':
     st.write("各単元（スプレッドシート）から表示したい分野を選んでください。（全分野を選ぶ場合は、各単元の「全分野を表示する」にチェックを入れます）")
     
     if st.button("🔄 スプレッドシートのデータを再読み込み"):
-        with st.spinner("全単元のデータを再読み込みしています..."):
+        with st.spinner("認証キャッシュをクリアし、全単元のデータを再読み込みしています..."):
+            st.cache_resource.clear()
             load_data(list(SPREADSHEET_KEYS.keys()))
             st.rerun()
 
