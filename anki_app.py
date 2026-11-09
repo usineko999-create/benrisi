@@ -23,8 +23,8 @@ CREDENTIALS_FILE = "secret_key.json"
 
 # 【重要】ここの単元名と文字列を、ご自身のスプレッドシートのキーに書き換えてください
 SPREADSHEET_KEYS = {
-    "語呂合わせ_特許・実用新案": "1GOA12mzr6yWzm1Cdu-TMmnQdZ_Y8goV5I5MT9IcPKLw",
-    
+    "語呂合わせ_特許・実用新案": "1GOA12mzr6yWzm1Cdu-TMmnQdZ_Y8goV5I5MT9IcPKLw"
+
 }
 
 @st.cache_resource
@@ -65,6 +65,8 @@ if 'pending_updates' not in st.session_state:
     st.session_state.pending_updates = {}
 if 'sheet_col_meta' not in st.session_state:
     st.session_state.sheet_col_meta = {}
+if 'load_debug_info' not in st.session_state:
+    st.session_state.load_debug_info = {}
 
 # ==========================================
 # 列位置特定・並列処理用ヘルパー関数群
@@ -82,23 +84,29 @@ def _detect_sheet_columns(headers):
     cat_target1 = normalize_nfc("分野")
     cat_target2 = normalize_nfc("子フォルダ名")
     
-    # 「要注意」列の特定（見つからない場合は5列目をデフォルトとする）
+    # 「要注意」列の特定（見つからない場合は既存のデータ列を上書きしないよう右端の空き列または5列目を使用）
     caution_col_idx = None
     for idx, nh in enumerate(norm_headers):
         if nh == caution_target or nh == wrong_target:
             caution_col_idx = idx + 1
             break
     if caution_col_idx is None:
-        caution_col_idx = 5
+        non_empty_indices = [idx + 1 for idx, nh in enumerate(norm_headers) if nh != ""]
+        max_used_col = max(non_empty_indices) if non_empty_indices else 4
+        caution_col_idx = max(5, max_used_col + 1)
 
-    # 「出題順序」列の特定（見つからない場合は「要注意」列の右隣とする）
+    # 「出題順序」列の特定（見つからない場合は「要注意」列の右隣または空き列とする）
     order_col_idx = None
     for idx, nh in enumerate(norm_headers):
         if nh == order_target:
             order_col_idx = idx + 1
             break
     if order_col_idx is None:
-        order_col_idx = caution_col_idx + 1
+        non_empty_indices = [idx + 1 for idx, nh in enumerate(norm_headers) if nh != ""]
+        max_used_col = max(non_empty_indices) if non_empty_indices else 4
+        order_col_idx = max(caution_col_idx + 1, max_used_col + 1)
+        if order_col_idx == caution_col_idx:
+            order_col_idx += 1
 
     # 表示用ラベル列（「分野」「要注意」「出題順序」および空白ヘッダーを除外）
     display_cols = []
@@ -134,38 +142,67 @@ def _check_single_sheet_resume(subj, key, client):
 
 def _load_single_sheet_data(subj, key, client):
     try:
-        ws = client.open_by_key(key).sheet1
+        sh = client.open_by_key(key)
+        ws = sh.sheet1
+        sheet_title = ws.title
         data = ws.get_all_values()
-        if len(data) > 1:
-            raw_headers = [str(h).strip() for h in data[0]]
+        total_rows = len(data)
+        raw_headers = [str(h).strip() for h in data[0]] if total_rows > 0 else []
+
+        if total_rows > 1:
             caution_col_idx, order_col_idx, display_cols = _detect_sheet_columns(raw_headers)
             
             # 必要な列数分だけ各行の長さを揃える
             max_needed_cols = max(len(raw_headers), caution_col_idx, order_col_idx)
-            while len(raw_headers) < max_needed_cols:
-                raw_headers.append("")
+            padded_headers = list(raw_headers)
+            while len(padded_headers) < max_needed_cols:
+                padded_headers.append("")
                 
-            col_names = list(raw_headers)
+            col_names = list(padded_headers)
             col_names[caution_col_idx - 1] = "要注意"
             col_names[order_col_idx - 1] = "出題順序"
             
-            # 分野列の正規化判定と統一
+            # 分野列の正規化判定と統一（最初に見つかった1列のみを「分野」とする）
+            found_cat = False
             for idx, h in enumerate(col_names):
                 nh = normalize_nfc(h)
                 if nh == normalize_nfc("子フォルダ名") or nh == normalize_nfc("分野"):
-                    col_names[idx] = "分野"
+                    if not found_cat:
+                        col_names[idx] = "分野"
+                        found_cat = True
+            if not found_cat and len(col_names) > 0 and col_names[0] not in ("要注意", "出題順序"):
+                if col_names[0] in display_cols:
+                    display_cols.remove(col_names[0])
+                col_names[0] = "分野"
+
+            # 同名の列名が複数ある場合にDataFrame結合エラーを防ぐためユニーク化
+            unique_col_names = []
+            seen_counts = {}
+            display_cols_updated = []
+            for idx, c in enumerate(col_names):
+                if c == "":
+                    unique_col_names.append("")
+                    continue
+                c_nfc = normalize_nfc(c)
+                if c_nfc in seen_counts:
+                    seen_counts[c_nfc] += 1
+                    new_c = f"{c}_{seen_counts[c_nfc]}"
+                else:
+                    seen_counts[c_nfc] = 1
+                    new_c = c
+                unique_col_names.append(new_c)
+                if (idx + 1) not in (caution_col_idx, order_col_idx) and new_c != "分野":
+                    display_cols_updated.append(new_c)
+            display_cols = display_cols_updated
                     
             padded_rows = [
                 r + [""] * (max_needed_cols - len(r)) if len(r) < max_needed_cols else r[:max_needed_cols]
                 for r in data[1:]
             ]
-            df = pd.DataFrame(padded_rows, columns=col_names)
+            df = pd.DataFrame(padded_rows, columns=unique_col_names)
             
-            # 重複する空欄列名があれば除去
+            # 空欄列名があれば除去
             df = df.loc[:, [c != "" for c in df.columns]]
-            
-            if '分野' not in df.columns and len(df.columns) > 0:
-                df = df.rename(columns={df.columns[0]: '分野'})
                 
             # 元の行番号（スプレッドシート上の行番号：2行目始まり）を保持
             df['row_num'] = df.index + 2
@@ -193,10 +230,35 @@ def _load_single_sheet_data(subj, key, client):
                 'order_col': order_col_idx,
                 'display_cols': display_cols
             }
-            return subj, (df, meta)
-        return subj, (pd.DataFrame(), {'caution_col': 5, 'order_col': 6, 'display_cols': []})
+            debug_info = {
+                'status': 'success' if not df.empty else 'empty_after_filter',
+                'sheet_title': sheet_title,
+                'total_rows': total_rows,
+                'valid_rows': len(df),
+                'raw_headers': raw_headers,
+                'display_cols': display_cols,
+                'has_category_col': '分野' in df.columns,
+                'non_empty_categories': int((df['分野'].astype(str).str.strip() != '').sum()) if '分野' in df.columns and not df.empty else 0
+            }
+            return subj, (df, meta, debug_info)
+
+        debug_info = {
+            'status': 'no_data_rows',
+            'sheet_title': sheet_title,
+            'total_rows': total_rows,
+            'valid_rows': 0,
+            'raw_headers': raw_headers,
+            'display_cols': []
+        }
+        return subj, (pd.DataFrame(), {'caution_col': 5, 'order_col': 6, 'display_cols': []}, debug_info)
     except Exception as e:
-        return subj, e
+        debug_info = {
+            'status': 'error',
+            'error_type': type(e).__name__,
+            'error_msg': str(e),
+            'key': key
+        }
+        return subj, (e, debug_info)
 
 def _save_single_sheet(subj, key, updates, col_meta, client):
     try:
@@ -271,6 +333,11 @@ def load_data(subjects_to_load):
     client, err = get_gspread_client()
     if err:
         st.error(f"⚠️ 接続エラー: {err}")
+        for subj in subjects_to_load:
+            st.session_state.load_debug_info[subj] = {
+                'status': 'auth_error',
+                'error_msg': str(err)
+            }
         return
         
     all_data = []
@@ -278,12 +345,18 @@ def load_data(subjects_to_load):
         futures = {executor.submit(_load_single_sheet_data, subj, SPREADSHEET_KEYS[subj], client): subj for subj in subjects_to_load}
         for future in concurrent.futures.as_completed(futures):
             subj, result = future.result()
-            if isinstance(result, tuple):
-                df, meta = result
+            if isinstance(result, tuple) and len(result) == 3:
+                df, meta, debug_info = result
                 st.session_state.sheet_col_meta[subj] = meta
+                st.session_state.load_debug_info[subj] = debug_info
                 if not df.empty:
                     all_data.append(df)
+            elif isinstance(result, tuple) and len(result) == 2:
+                err_obj, debug_info = result
+                st.session_state.load_debug_info[subj] = debug_info
+                st.error(f"「{subj}」の読み込みに失敗: {err_obj}")
             else:
+                st.session_state.load_debug_info[subj] = {'status': 'unknown_error', 'error_msg': str(result)}
                 st.error(f"「{subj}」の読み込みに失敗: {result}")
             
     if all_data:
@@ -331,6 +404,54 @@ def save_learning_records():
     st.session_state.pending_updates = {}
     st.session_state.resume_info = None
 
+def _render_debug_message(subj):
+    """「データがありません。」となった具体的な原因を画面上に診断表示するデバッグ関数"""
+    info = st.session_state.load_debug_info.get(subj)
+    if not info:
+        st.warning(
+            f"🔍 **【原因診断：{subj}】**\n\n"
+            f"この単元のデータがまだメモリに読み込まれていません（設定画面を開いたままコードの `SPREADSHEET_KEYS` を変更した場合などに発生します）。\n\n"
+            f"👉 画面上部の **「🔄 スプレッドシートのデータを再読み込み」** ボタンを押すか、一度トップ画面に戻り再度この画面へ進んでください。"
+        )
+        return
+
+    status = info.get('status')
+    if status == 'error':
+        err_type = info.get('error_type', '')
+        err_msg = info.get('error_msg', '')
+        key_val = info.get('key', '')
+        st.error(
+            f"🔍 **【原因診断：{subj}】Googleスプレッドシートの読み込み時にエラーが発生しました**\n\n"
+            f"- **エラー種類**: `{err_type}`\n"
+            f"- **エラー詳細**: `{err_msg}`\n"
+            f"- **指定されたキー**: `{key_val}`\n\n"
+            f"**💡 対処方法**:\n"
+            f"1. `PermissionError` や `APIError(403)` 等が出る場合：対象のスプレッドシートの右上「共有」ボタンから、**サービスアカウントのメールアドレス（`〜@〜.iam.gserviceaccount.com`）を「編集者」として追加**してください。\n"
+            f"2. `SpreadsheetNotFound` や `404` 等が出る場合：`SPREADSHEET_KEYS` に設定したシートのキー（ID文字列）に誤りがないか確認してください。"
+        )
+    elif status == 'no_data_rows':
+        st.warning(
+            f"🔍 **【原因診断：{subj}】スプレッドシートの2行目以降にデータが見つかりません**\n\n"
+            f"- **読み込んだシート名（一番左のシート）**: `{info.get('sheet_title')}`\n"
+            f"- **取得された総行数**: `{info.get('total_rows')} 行`\n"
+            f"- **1行目のヘッダー**: `{info.get('raw_headers')}`\n\n"
+            f"**💡 対処方法**: プログラムはスプレッドシートの**一番左にあるシート**を読み込みます。データが2番目以降のシートに入っていないか、2行目以降にデータが入力されているかを確認してください。"
+        )
+    elif status == 'empty_after_filter':
+        st.warning(
+            f"🔍 **【原因診断：{subj}】シートは読み込めましたが、表示対象となる有効な行が0件でした**\n\n"
+            f"- **読み込んだシート名**: `{info.get('sheet_title')}` （総行数: `{info.get('total_rows')} 行`）\n"
+            f"- **1行目のヘッダー**: `{info.get('raw_headers')}`\n"
+            f"- **認識された表示用ラベル列**: `{info.get('display_cols')}`\n\n"
+            f"**💡 対処方法**: 1行目（ヘッダー行）が空欄になっていないか確認してください。1行目にタイトル行や空行があり、2行目以降にラベル名（分野など）がある場合は、1行目がラベル名になるよう上部の不要な行を削除してください。"
+        )
+    elif status == 'auth_error':
+        st.error(f"🔍 **【原因診断：{subj}】認証エラー**: `{info.get('error_msg')}`")
+    else:
+        st.info(
+            f"🔍 **【原因診断：{subj}】詳細ステータス**: `{info}`"
+        )
+
 # --- メインUI ---
 st.title("📖 暗記リスト学習アプリ")
 
@@ -368,6 +489,11 @@ elif st.session_state.stage == 'setup':
     st.subheader("新規暗記リストの表示範囲設定")
     st.write("各単元（スプレッドシート）から表示したい分野を選んでください。（全分野を選ぶ場合は、各単元の「全分野を表示する」にチェックを入れます）")
     
+    if st.button("🔄 スプレッドシートのデータを再読み込み"):
+        with st.spinner("全単元のデータを再読み込みしています..."):
+            load_data(list(SPREADSHEET_KEYS.keys()))
+            st.rerun()
+
     all_df = st.session_state.all_df
     selected_dfs = []
     
@@ -375,12 +501,14 @@ elif st.session_state.stage == 'setup':
         with st.expander(f"📚 {subj}", expanded=False):
             if all_df.empty:
                 st.write("データがありません。")
+                _render_debug_message(subj)
                 continue
             
             subj_norm = normalize_nfc(subj)
             subj_df = all_df[all_df['科目'].apply(normalize_nfc) == subj_norm]
             if subj_df.empty:
                 st.write("データがありません。")
+                _render_debug_message(subj)
                 continue
                 
             # 分野の重複排除（NFC正規化ベースで比較しつつ元の表記を保持）
@@ -395,6 +523,12 @@ elif st.session_state.stage == 'setup':
                     seen_cats_nfc.add(cat_nfc)
                     categories.append(cat_str)
             
+            if not categories:
+                st.warning(
+                    f"⚠️ データは `{len(subj_df)}件` 読み込まれましたが、「分野」列（A列）がすべて空欄のため分野を選択できません。"
+                    f"（認識された1行目のヘッダー: `{st.session_state.load_debug_info.get(subj, {}).get('raw_headers', [])}`）"
+                )
+
             use_all = st.checkbox(f"「{subj}」の全分野を表示する", key=f"chk_{subj}")
             if use_all:
                 selected_dfs.append(subj_df)
