@@ -16,7 +16,9 @@ st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layo
 CREDENTIALS_FILE = "secret_key.json"
 
 SPREADSHEET_KEYS = {
-    "特許・実用新案": "1rrzp90pSYL4YxSJEEtkFB4HZsIi9n3SUsoUX1qEN5XQ", 
+    "特許": "1rrzp90pSYL4YxSJEEtkFB4HZsIi9n3SUsoUX1qEN5XQ", 
+     "実用新案": "1O2lwfqMupy2yv3Af0wuLlvMg_2xDtT1cHMR1K55F-jo", 
+    "国際出願": "1JqL0rnInWGgctGclbeYvsSnCzihEUWV47yo9tHxHQI4",
     "意匠": "1hOTVzkr82pqjh_KaoHxV7Zd-dczFtlVdu_DMT-FvNVM",
     "商標": "1I0HMXWY6CU9mQJWEBdJXn47Xv2_ErdLdTSZ1xxm3AG4",
     "協定・条約": "1fH1naJGQfKXseXpHrVFnC9ip93YURgCMD67xPhbUEjQ",
