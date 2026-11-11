@@ -6,6 +6,7 @@ import json
 import concurrent.futures
 import os
 import unicodedata
+import html
 from collections.abc import Mapping
 import streamlit.components.v1 as components
 
@@ -16,8 +17,38 @@ def normalize_nfc(text):
         return ""
     return unicodedata.normalize('NFC', str(text))
 
-# --- ページ設定 ---
-st.set_page_config(page_title="暗記リストアプリ", page_icon="📖", layout="centered")
+# --- ページ設定（画面をより大きく使うため layout="wide" に設定） ---
+st.set_page_config(page_title="暗記リストアプリ", page_icon="📖", layout="wide")
+
+# --- 表示サイズ・強調ラベル列のデフォルト設定 ---
+# 基本フォントサイズ（px）
+DEFAULT_BASE_FONT_SIZE = 22
+# 強調表示するラベル列（複数指定可能。初期値として「語呂合わせ」を設定）
+DEFAULT_HIGHLIGHT_COLS = ["語呂合わせ"]
+# 強調表示するラベル列の文字サイズ倍率（他のラベル列に対する倍率）
+DEFAULT_HIGHLIGHT_SCALE = 1.5
+# 強調表示するラベル列の文字色（カラーコードまたは色名）
+DEFAULT_HIGHLIGHT_COLOR = "#e60000"  # 赤
+
+# 画面全体のフォントサイズ・余白を拡大するカスタムCSS
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1100px !important;
+            padding-top: 2rem !important;
+            padding-bottom: 3rem !important;
+        }
+        /* ボタン内のテキストも大きく見やすくする */
+        .stButton > button {
+            font-size: 1.2rem !important;
+            padding: 0.7rem 1.2rem !important;
+            height: auto !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # --- Googleスプレッドシート連携の設定 ---
 CREDENTIALS_FILE = "secret_key.json"
@@ -26,6 +57,7 @@ CREDENTIALS_FILE = "secret_key.json"
 SPREADSHEET_KEYS = {
     "語呂合わせ_特許・実用新案": "1GOA12mzr6yWzm1Cdu-TMmnQdZ_Y8goV5I5MT9IcPKLw"
 }
+
 
 @st.cache_resource
 def _authorize_cached_client(creds_json_str):
@@ -155,6 +187,16 @@ if 'sheet_col_meta' not in st.session_state:
     st.session_state.sheet_col_meta = {}
 if 'load_debug_info' not in st.session_state:
     st.session_state.load_debug_info = {}
+
+# 表示スタイル・強調設定用のセッション状態
+if 'base_font_size' not in st.session_state:
+    st.session_state.base_font_size = DEFAULT_BASE_FONT_SIZE
+if 'highlight_cols' not in st.session_state:
+    st.session_state.highlight_cols = list(DEFAULT_HIGHLIGHT_COLS)
+if 'highlight_scale' not in st.session_state:
+    st.session_state.highlight_scale = float(DEFAULT_HIGHLIGHT_SCALE)
+if 'highlight_color' not in st.session_state:
+    st.session_state.highlight_color = DEFAULT_HIGHLIGHT_COLOR
 
 # ==========================================
 # 列位置特定・並列処理用ヘルパー関数群
@@ -496,6 +538,91 @@ def save_learning_records():
     st.session_state.pending_updates = {}
     st.session_state.resume_info = None
 
+def _get_available_label_columns():
+    """読み込まれている全シートおよび現在の問題リストから選択可能なラベル列一覧を取得する"""
+    cols = []
+    seen_nfc = set()
+
+    def _add_col(c_name):
+        c_str = str(c_name).strip()
+        if not c_str:
+            return
+        c_nfc = normalize_nfc(c_str)
+        if c_nfc not in seen_nfc:
+            seen_nfc.add(c_nfc)
+            cols.append(c_str)
+
+    # デフォルト指定のラベル列（語呂合わせ等）を常に選択肢に含める
+    for dc in DEFAULT_HIGHLIGHT_COLS:
+        _add_col(dc)
+    for hc in st.session_state.highlight_cols:
+        _add_col(hc)
+
+    # 各単元のメタ情報から表示対象ラベル列を収集
+    for meta in st.session_state.sheet_col_meta.values():
+        for c in meta.get('display_cols', []):
+            _add_col(c)
+
+    # 現在進行中のquestionsからも収集（再開時などのため）
+    for q in st.session_state.questions:
+        for c in q.get('_display_cols', []):
+            _add_col(c)
+
+    return cols
+
+def _render_style_settings_ui(key_prefix="setup"):
+    """文字サイズ・特定ラベル列の強調表示設定を行うUIコンポーネント"""
+    available_cols = _get_available_label_columns()
+    available_nfc_map = {normalize_nfc(c): c for c in available_cols}
+
+    # セッション内の選択値をNFC正規化で照合して初期選択リストを作成
+    default_selected = []
+    for hc in st.session_state.highlight_cols:
+        hc_nfc = normalize_nfc(hc)
+        if hc_nfc in available_nfc_map:
+            matched_c = available_nfc_map[hc_nfc]
+            if matched_c not in default_selected:
+                default_selected.append(matched_c)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        base_size = st.slider(
+            "全体の基本文字サイズ (px)",
+            min_value=16,
+            max_value=40,
+            value=int(st.session_state.base_font_size),
+            step=1,
+            key=f"{key_prefix}_base_font_size"
+        )
+        st.session_state.base_font_size = base_size
+
+        selected_hl_cols = st.multiselect(
+            "強調表示するラベル列（複数選択可）",
+            options=available_cols,
+            default=default_selected,
+            key=f"{key_prefix}_highlight_cols"
+        )
+        st.session_state.highlight_cols = selected_hl_cols
+
+    with c2:
+        hl_scale = st.number_input(
+            "強調ラベル列の文字サイズ倍率（例: 1.5倍）",
+            min_value=1.0,
+            max_value=4.0,
+            value=float(st.session_state.highlight_scale),
+            step=0.1,
+            format="%.1f",
+            key=f"{key_prefix}_highlight_scale"
+        )
+        st.session_state.highlight_scale = float(hl_scale)
+
+        hl_color = st.color_picker(
+            "強調ラベル列の文字色（デフォルト：赤）",
+            value=st.session_state.highlight_color,
+            key=f"{key_prefix}_highlight_color"
+        )
+        st.session_state.highlight_color = hl_color
+
 def _render_debug_message(subj):
     """「データがありません。」となった具体的な原因を画面上に診断表示するデバッグ関数"""
     info = st.session_state.load_debug_info.get(subj)
@@ -637,6 +764,11 @@ elif st.session_state.stage == 'setup':
                     selected_dfs.append(matched_df)
     
     st.markdown("---")
+    st.subheader("🎨 文字サイズ・強調表示の設定")
+    st.caption("特定のラベル列（デフォルト：「語呂合わせ」）の記載事項を、指定した倍率・文字色で強調表示できます。")
+    _render_style_settings_ui(key_prefix="setup")
+
+    st.markdown("---")
     mode_seq = "先頭から順に表示"
     mode_rand = "ランダムに表示"
     mode_caution = "要注意のものから表示"
@@ -645,7 +777,7 @@ elif st.session_state.stage == 'setup':
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("暗記リストスタート！", type="primary"):
+        if st.button("暗記リストスタート！", type="primary", use_container_width=True):
             if not selected_dfs:
                 st.warning("表示する分野が1つも選択されていません。")
             else:
@@ -707,7 +839,7 @@ elif st.session_state.stage == 'setup':
                     st.rerun()
                     
     with col2:
-        if st.button("🔙 トップ画面に戻る"):
+        if st.button("🔙 トップ画面に戻る", use_container_width=True):
             st.session_state.stage = 'home'
             st.rerun()
 
@@ -736,23 +868,73 @@ elif st.session_state.stage == 'quiz':
         st.progress(current_q_num / total_q)
         st.caption(f"項目 {current_q_num} / {total_q}")
         
+        # 学習中にも文字サイズ・強調設定を微調整できる折りたたみパネル
+        with st.expander("🎨 文字サイズ・強調表示の設定を変更する", expanded=False):
+            _render_style_settings_ui(key_prefix="quiz")
+
         current_q = st.session_state.questions[st.session_state.current_idx]
         
-        st.markdown(f"**【{current_q['科目']} - {current_q['分野']}】**")
+        base_px = int(st.session_state.base_font_size)
+        hl_scale = float(st.session_state.highlight_scale)
+        hl_px = int(round(base_px * hl_scale))
+        hl_color = st.session_state.highlight_color
+        highlight_cols_nfc = {normalize_nfc(c).strip() for c in st.session_state.highlight_cols}
+
+        # 単元・分野タイトルも大きく見やすく表示
+        subj_escaped = html.escape(str(current_q.get('科目', '')))
+        cat_escaped = html.escape(str(current_q.get('分野', '')))
+        st.markdown(
+            f"<div style='font-size: {int(base_px * 1.1)}px; font-weight: bold; margin-bottom: 6px;'>"
+            f"【{subj_escaped} - {cat_escaped}】</div>",
+            unsafe_allow_html=True
+        )
         if int(current_q.get('要注意', 0)) > 0:
-            st.caption(f"※現在の要注意カウント: {int(current_q['要注意'])}")
+            st.markdown(
+                f"<div style='font-size: {max(14, int(base_px * 0.8))}px; color: #d97706; margin-bottom: 10px;'>"
+                f"※現在の要注意カウント: {int(current_q['要注意'])}</div>",
+                unsafe_allow_html=True
+            )
             
         # 「要注意」ラベル列以外の各列を「ラベル：内容」として固定表示
+        # 選択された強調ラベル列（語呂合わせ等）は指定倍率の文字サイズ＆指定色で表示
         display_cols = current_q.get('_display_cols', [])
-        display_lines = []
+        html_blocks = []
         for col_name in display_cols:
             cell_val = current_q.get(col_name, "")
             if pd.isna(cell_val):
                 cell_val = ""
-            display_lines.append(f"**{col_name}**：{cell_val}")
+            col_escaped = html.escape(str(col_name))
+            val_escaped = html.escape(str(cell_val)).replace("\n", "<br>")
+
+            # NFC正規化で強調対象ラベル列かどうかを判定（例: 「語呂合わせ」や同名列の「語呂合わせ_2」等にも対応）
+            col_nfc = normalize_nfc(col_name).strip()
+            base_col_nfc = col_nfc.rsplit('_', 1)[0] if '_' in col_nfc and col_nfc.rsplit('_', 1)[1].isdigit() else col_nfc
+            is_highlighted = (col_nfc in highlight_cols_nfc) or (base_col_nfc in highlight_cols_nfc)
+
+            if is_highlighted:
+                html_blocks.append(
+                    f"<div style='margin-bottom: 18px; line-height: 1.6;'>"
+                    f"<span style='font-size: {base_px}px; font-weight: bold; color: #1e293b;'>{col_escaped}：</span>"
+                    f"<span style='font-size: {hl_px}px; font-weight: bold; color: {hl_color};'>{val_escaped}</span>"
+                    f"</div>"
+                )
+            else:
+                html_blocks.append(
+                    f"<div style='margin-bottom: 16px; line-height: 1.6; font-size: {base_px}px; color: #1e293b;'>"
+                    f"<span style='font-weight: bold;'>{col_escaped}：</span>"
+                    f"<span>{val_escaped}</span>"
+                    f"</div>"
+                )
             
-        if display_lines:
-            st.info("  \n\n".join(display_lines))
+        if html_blocks:
+            card_html = (
+                "<div style='background-color: #f0f6ff; border-left: 6px solid #3b82f6; "
+                "padding: 28px 32px; border-radius: 12px; margin-top: 8px; margin-bottom: 24px; "
+                "box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);'>"
+                + "".join(html_blocks)
+                + "</div>"
+            )
+            st.markdown(card_html, unsafe_allow_html=True)
         else:
             st.warning("表示可能なラベル列が見つかりません。")
 
