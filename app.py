@@ -6,6 +6,8 @@ import json
 import concurrent.futures
 import os
 import streamlit.components.v1 as components
+import unicodedata
+import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="正誤クイズアプリ", page_icon="📝", layout="centered")
@@ -260,7 +262,19 @@ elif st.session_state.stage == 'setup':
                 st.write("データがありません。")
                 continue
                 
-            categories = list(subj_df['分野'].dropna().unique())
+            def _category_sort_key(val):
+                val_nfc = unicodedata.normalize('NFC', str(val))
+                return re.sub(
+                    r'[0-9０-９]+',
+                    lambda m: '0' + m.group(0) if len(m.group(0)) == 1 and m.group(0) not in ('0', '０') else m.group(0),
+                    val_nfc,
+                    count=1
+                )
+
+            categories = sorted(
+                list(subj_df['分野'].dropna().unique()),
+                key=_category_sort_key
+            )
             
             use_all = st.checkbox(f"「{subj}」の全単元を出題する", key=f"chk_{subj}")
             if use_all:
