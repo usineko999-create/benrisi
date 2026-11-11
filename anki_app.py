@@ -55,7 +55,12 @@ CREDENTIALS_FILE = "secret_key.json"
 
 # 【重要】ここの単元名と文字列を、ご自身のスプレッドシートのキーに書き換えてください
 SPREADSHEET_KEYS = {
-    "語呂合わせ_特許・実用新案": "1GOA12mzr6yWzm1Cdu-TMmnQdZ_Y8goV5I5MT9IcPKLw"
+    "特許": "1GOA12mzr6yWzm1Cdu-TMmnQdZ_Y8goV5I5MT9IcPKLw",
+    "実用新案":"1vD98TVxux7IEGbuc1ZV1IUyqjwbGVrhu4HGU9_RNmvM",
+    "意匠":"1wdZD-grY1wCwNi1ylaIsUfNp72KQ6fet5A_WrZnlliE",
+    "商標":"1qW1OwViuw5LAP2rIoPvC65R3Bh0dMZvhegbujjzDXCE",
+    "条約・協定":"1ikoeUqbk8e13ASrku3hVpGUxmGsaPi-F1TANbJVhre0",
+    "不正競争・著作権":"1L3Wu4POBTHuEITpHzpSot2Np5qCgOJqvOM8EGEiU5Bs"
 }
 
 
